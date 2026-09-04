@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/openclaw/openclaw.git",
+  "application_base": "bd2a91dac35a4975eb8b544f95cefa32bf4229a1",
+  "application_order": [
+    "patches/0001-memory-core-avoid-full-retry-storm.patch",
+    "patches/0002-memory-keep-searches-read-only.patch",
+    "patches/0003-ai-preserve-codex-stateless-aliases.patch"
+  ],
+  "patches": [
+    {
+      "order": 1,
+      "file": "patches/0001-memory-core-avoid-full-retry-storm.patch",
+      "commit": "3c91576a144029261435354efa42c4fd73566342",
+      "original_parent": "bd2a91dac35a4975eb8b544f95cefa32bf4229a1",
+      "subject": "fix(memory-core): avoid full retry storm on revision race",
+      "depends_on": [],
+      "sha256": "e8a36e2f3afdabfa359ff0d2333af9ee3519c6ae10fe0bc6ff68772b49591895",
+      "touched_paths": [
+        "extensions/memory-core/src/memory/manager-db.ts",
+        "extensions/memory-core/src/memory/manager-sync-ops.ts",
+        "extensions/memory-core/src/memory/manager.reindex-recovery.test.ts"
+      ]
+    },
+    {
+      "order": 2,
+      "file": "patches/0002-memory-keep-searches-read-only.patch",
+      "commit": "1093a13d6de3fcbdb6135465de8269b96b9d3094",
+      "original_parent": "c0d6a2db1640af422b0a68f125605242d408e4ce",
+      "subject": "fix(memory): keep searches read-only and reusable",
+      "depends_on": [
+        "3c91576a144029261435354efa42c4fd73566342"
+      ],
+      "sha256": "a6c2925f36f0dca311cd5c342a5f38a5799b304b3c7b9c828e8667ed3fc7bea0",
+      "touched_paths": [
+        "extensions/memory-core/src/memory-get-corpus.test.ts",
+        "extensions/memory-core/src/memory/index.test.ts",
+        "extensions/memory-core/src/memory/manager-close-lifecycle.ts",
+        "extensions/memory-core/src/memory/manager-db.test.ts",
+        "extensions/memory-core/src/memory/manager-db.ts",
+        "extensions/memory-core/src/memory/manager-index.test-support.ts",
+        "extensions/memory-core/src/memory/manager-provider-lifecycle.ts",
+        "extensions/memory-core/src/memory/manager-registry.test.ts",
+        "extensions/memory-core/src/memory/manager-registry.ts",
+        "extensions/memory-core/src/memory/manager-search-orchestration.ts",
+        "extensions/memory-core/src/memory/manager-sync-base.ts",
+        "extensions/memory-core/src/memory/manager.self-heal-missing-identity.test.ts",
+        "extensions/memory-core/src/memory/manager.ts",
+        "extensions/memory-core/src/memory/search-deadline.test.ts",
+        "extensions/memory-core/src/memory/search-deadline.ts",
+        "extensions/memory-core/src/memory/search-manager.ts",
+        "extensions/memory-core/src/tools.citations.test.ts",
+        "extensions/memory-core/src/tools.real-manager.test.ts",
+        "extensions/memory-core/src/tools.shared.ts",
+        "extensions/memory-core/src/tools.test.ts",
+        "extensions/memory-core/src/tools.ts",
+        "src/gateway/server-methods/memory-search.test.ts",
+        "src/gateway/server-methods/memory-search.ts",
+        "src/plugin-sdk/sqlite-runtime.ts",
+        "src/plugins/memory-runtime.ts",
+        "src/plugins/registry-contribution-types.ts"
+      ]
+    },
+    {
+      "order": 3,
+      "file": "patches/0003-ai-preserve-codex-stateless-aliases.patch",
+      "commit": "f4a81adcdd56efd92ff6f2a910b13f9cd886fe47",
+      "original_parent": "b02ee645a8976573595216db893f67a10359a135",
+      "subject": "fix(ai): preserve Codex stateless policy through provider aliases",
+      "depends_on": [],
+      "sha256": "82617eef938c666111716753f1b4f187d024c7a76a111fef9a454052f5af5625",
+      "touched_paths": [
+        "packages/ai/src/transports/openai-responses-params-internal.test.ts",
+        "packages/ai/src/transports/openai-responses-params-internal.ts",
+        "packages/ai/src/transports/openai-transport-params.ts"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+From f4a81adcdd56efd92ff6f2a910b13f9cd886fe47 Mon Sep 17 00:00:00 2001
+From: saladinyao-cyber <240252919+saladinyao-cyber@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 07:43:45 +0800
+Subject: [PATCH] fix(ai): preserve Codex stateless policy through provider
+ aliases
+
+---
+ .../openai-responses-params-internal.test.ts  | 36 ++++++++++++++++++-
+ .../openai-responses-params-internal.ts       |  1 +
+ .../src/transports/openai-transport-params.ts | 22 ++++++++++--
+ 3 files changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/packages/ai/src/transports/openai-responses-params-internal.test.ts b/packages/ai/src/transports/openai-responses-params-internal.test.ts
+index b286f48fd5..020e35307a 100644
+--- a/packages/ai/src/transports/openai-responses-params-internal.test.ts
++++ b/packages/ai/src/transports/openai-responses-params-internal.test.ts
+@@ -1,6 +1,9 @@
+ import type { Model } from "@openclaw/llm-core";
+ import { describe, expect, it } from "vitest";
+-import { buildOpenAIResponsesCompactSystemMessage } from "./openai-responses-params-internal.js";
++import {
++  buildOpenAIResponsesCompactSystemMessage,
++  sanitizeOpenAICodexResponsesParams,
++} from "./openai-responses-params-internal.js";
+ 
+ const reasoningModel = {
+   id: "gpt-5.6-luna",
+@@ -15,6 +18,37 @@ const reasoningModel = {
+   maxTokens: 8_192,
+ } satisfies Model<"openai-responses">;
+ 
++describe("sanitizeOpenAICodexResponsesParams", () => {
++  it("restores stateless Codex payload policy for provider-stream aliases", () => {
++    const providerStreamModel = {
++      ...reasoningModel,
++      api: "openclaw-provider-stream:openai:gpt-5.6-luna:openai-chatgpt-responses:https%3A%2F%2Fchatgpt.com%2Fbackend-api%2Fcodex",
++      baseUrl: "https://chatgpt.com/backend-api/codex",
++    } as Model;
++    const params = sanitizeOpenAICodexResponsesParams(providerStreamModel, {
++      model: providerStreamModel.id,
++      store: true,
++      max_output_tokens: 128,
++      metadata: { purpose: "dashboard-title" },
++      text: { format: { type: "text" }, verbosity: "low" },
++    });
++
++    expect(params.store).toBe(false);
++    expect(params).not.toHaveProperty("max_output_tokens");
++    expect(params).not.toHaveProperty("metadata");
++    expect(params.text).toEqual({ verbosity: "low" });
++  });
++
++  it("does not rewrite non-Codex Responses endpoints", () => {
++    const params = sanitizeOpenAICodexResponsesParams(reasoningModel, {
++      store: true,
++      max_output_tokens: 128,
++    });
++
++    expect(params).toEqual({ store: true, max_output_tokens: 128 });
++  });
++});
++
+ describe("buildOpenAIResponsesCompactSystemMessage", () => {
+   it("uses the developer role for reasoning models that support it", () => {
+     expect(
+diff --git a/packages/ai/src/transports/openai-responses-params-internal.ts b/packages/ai/src/transports/openai-responses-params-internal.ts
+index fba499a9da..ad65877885 100644
+--- a/packages/ai/src/transports/openai-responses-params-internal.ts
++++ b/packages/ai/src/transports/openai-responses-params-internal.ts
+@@ -174,6 +174,7 @@ export function sanitizeOpenAICodexResponsesParams<T extends Record<string, unkn
+   for (const key of OPENAI_CODEX_RESPONSES_UNSUPPORTED_PARAMS) {
+     delete params[key];
+   }
++  params.store = false;
+   stripOpenAICodexResponsesUnsupportedTextFields(params);
+   return params;
+ }
+diff --git a/packages/ai/src/transports/openai-transport-params.ts b/packages/ai/src/transports/openai-transport-params.ts
+index 710ecf6099..545bdd4544 100644
+--- a/packages/ai/src/transports/openai-transport-params.ts
++++ b/packages/ai/src/transports/openai-transport-params.ts
+@@ -306,11 +306,27 @@ export function resolveOpenAIStrictToolFlagWithDiagnostics(
+   return strict;
+ }
+ 
++function isOpenAIChatGPTResponsesApi(api: string): boolean {
++  if (api === "openai-chatgpt-responses" || api === "openclaw-openai-chatgpt-responses-transport") {
++    return true;
++  }
++  if (!api.startsWith("openclaw-provider-stream:")) {
++    return false;
++  }
++  const sourceApi = api.split(":")[3];
++  if (!sourceApi) {
++    return false;
++  }
++  try {
++    return decodeURIComponent(sourceApi) === "openai-chatgpt-responses";
++  } catch {
++    return false;
++  }
++}
++
+ export function isOpenAICodexResponsesModel(model: Model): boolean {
+   return (
+-    OPENAI_CODEX_RESPONSES_PROVIDERS.has(model.provider) &&
+-    (model.api === "openai-chatgpt-responses" ||
+-      model.api === "openclaw-openai-chatgpt-responses-transport")
++    OPENAI_CODEX_RESPONSES_PROVIDERS.has(model.provider) && isOpenAIChatGPTResponsesApi(model.api)
+   );
+ }
+ 
+-- 
+2.53.0
+
