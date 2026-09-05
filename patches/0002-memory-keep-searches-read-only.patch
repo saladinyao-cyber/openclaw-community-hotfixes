@@ -1,0 +1,1554 @@
+From 1093a13d6de3fcbdb6135465de8269b96b9d3094 Mon Sep 17 00:00:00 2001
+From: saladinyao-cyber <240252919+saladinyao-cyber@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 21:18:04 +0800
+Subject: [PATCH] fix(memory): keep searches read-only and reusable
+
+---
+ .../memory-core/src/memory-get-corpus.test.ts |   4 +-
+ .../memory-core/src/memory/index.test.ts      |  60 +++++
+ .../src/memory/manager-close-lifecycle.ts     | 166 ++++++++++++++
+ .../memory-core/src/memory/manager-db.test.ts |  74 ++++++-
+ .../memory-core/src/memory/manager-db.ts      | 122 ++++++++++-
+ .../src/memory/manager-index.test-support.ts  |   4 +-
+ .../src/memory/manager-provider-lifecycle.ts  |   9 +-
+ .../src/memory/manager-registry.test.ts       |  70 ++++++
+ .../src/memory/manager-registry.ts            |   7 +-
+ .../memory/manager-search-orchestration.ts    |   4 +-
+ .../src/memory/manager-sync-base.ts           |  26 ++-
+ ...manager.self-heal-missing-identity.test.ts |   2 +-
+ extensions/memory-core/src/memory/manager.ts  | 206 ++++--------------
+ .../src/memory/search-deadline.test.ts        |  10 +-
+ .../memory-core/src/memory/search-deadline.ts |   2 +-
+ .../memory-core/src/memory/search-manager.ts  |   2 +-
+ .../memory-core/src/tools.citations.test.ts   |  16 +-
+ .../src/tools.real-manager.test.ts            |  28 +--
+ extensions/memory-core/src/tools.shared.ts    |  22 +-
+ extensions/memory-core/src/tools.test.ts      |  28 ++-
+ extensions/memory-core/src/tools.ts           |   2 +-
+ .../server-methods/memory-search.test.ts      |   4 +-
+ src/gateway/server-methods/memory-search.ts   |   8 +-
+ src/plugin-sdk/sqlite-runtime.ts              |   5 +
+ src/plugins/memory-runtime.ts                 |   2 +-
+ src/plugins/registry-contribution-types.ts    |   4 +-
+ 26 files changed, 657 insertions(+), 230 deletions(-)
+ create mode 100644 extensions/memory-core/src/memory/manager-close-lifecycle.ts
+
+diff --git a/extensions/memory-core/src/memory-get-corpus.test.ts b/extensions/memory-core/src/memory-get-corpus.test.ts
+index 7880ddc0ae..14e6d69de6 100644
+--- a/extensions/memory-core/src/memory-get-corpus.test.ts
++++ b/extensions/memory-core/src/memory-get-corpus.test.ts
+@@ -316,7 +316,7 @@ describe("memory_get corpus outcomes", () => {
+       path: lookup,
+       corpus: "all",
+     });
+-    await vi.advanceTimersByTimeAsync(15_000);
++    await vi.advanceTimersByTimeAsync(30_000);
+ 
+     await expect(pending).resolves.toMatchObject({
+       details: {
+@@ -326,7 +326,7 @@ describe("memory_get corpus outcomes", () => {
+           {
+             corpus: "wiki",
+             outcome: "unavailable",
+-            error: "memory_get timed out after 15s",
++            error: "memory_get timed out after 30s",
+           },
+         ],
+       },
+diff --git a/extensions/memory-core/src/memory/index.test.ts b/extensions/memory-core/src/memory/index.test.ts
+index aeae08475d..3a0136a8b6 100644
+--- a/extensions/memory-core/src/memory/index.test.ts
++++ b/extensions/memory-core/src/memory/index.test.ts
+@@ -446,6 +446,66 @@ describe("memory index", () => {
+     }
+   });
+ 
++  it("keeps provenance candidate repair read-only for search managers", async () => {
++    const projectKey = "github.com/openclaw/openclaw";
++    await fs.writeFile(
++      path.join(fixture.paths.workspace, "MEMORY.md"),
++      `- Preserve search-only preference. <!-- trigger: search-only preference --> <!-- project: ${projectKey} -->\n`,
++    );
++    const cfg = createCfg({ provider: "mock" });
++    const writer = await getFreshManager(cfg);
++    await writer.sync({ reason: "test", force: true });
++    const databasePath = writer.status().dbPath!;
++    const databaseDir = path.dirname(databasePath);
++    const shadowPrefix = `${path.basename(databasePath)}.memory-reindex-`;
++    const writerDb = Reflect.get(writer, "db") as DatabaseSync;
++    writerDb
++      .prepare(
++        `UPDATE memory_index_sources SET hash = ''
++         WHERE path = 'MEMORY.md' AND source = 'memory'`,
++      )
++      .run();
++    const revisionBefore = writerDb
++      .prepare("SELECT revision FROM memory_index_state WHERE id = 1")
++      .get();
++    await writer.close();
++
++    const providerCallsBefore = providerFixture.providerCalls.length;
++    const searchManager = await getFreshManager(cfg, "search");
++    try {
++      expect(searchManager.status().dirty).toBe(true);
++      if (!searchManager.listCuratedProjectCandidates || !searchManager.listTriggerCandidates) {
++        throw new Error("expected curated project and trigger candidate listing");
++      }
++
++      await expect(
++        searchManager.listCuratedProjectCandidates({ activeProjectKeys: [projectKey] }),
++      ).resolves.toEqual([]);
++      await expect(
++        searchManager.listTriggerCandidates({ activeProjectKeys: [projectKey] }),
++      ).resolves.toEqual([]);
++
++      expect(providerFixture.providerCalls).toHaveLength(providerCallsBefore);
++      expect(
++        (await fs.readdir(databaseDir)).filter((entry) => entry.startsWith(shadowPrefix)),
++      ).toEqual([]);
++      const searchDb = Reflect.get(searchManager, "db") as DatabaseSync;
++      expect(
++        searchDb
++          .prepare(
++            `SELECT hash FROM memory_index_sources
++             WHERE path = 'MEMORY.md' AND source = 'memory'`,
++          )
++          .get(),
++      ).toEqual({ hash: "" });
++      expect(
++        searchDb.prepare("SELECT revision FROM memory_index_state WHERE id = 1").get(),
++      ).toEqual(revisionBefore);
++    } finally {
++      await searchManager.close();
++    }
++  });
++
+   it("keeps invalid project annotations scoped but unsatisfiable", async () => {
+     await fs.writeFile(
+       path.join(fixture.paths.workspace, "MEMORY.md"),
+diff --git a/extensions/memory-core/src/memory/manager-close-lifecycle.ts b/extensions/memory-core/src/memory/manager-close-lifecycle.ts
+new file mode 100644
+index 0000000000..b8cb20a410
+--- /dev/null
++++ b/extensions/memory-core/src/memory/manager-close-lifecycle.ts
+@@ -0,0 +1,166 @@
++// Memory Core plugin module owns manager shutdown and provider retirement.
++import { formatErrorMessage, toErrorObject } from "openclaw/plugin-sdk/error-runtime";
++import { createSubsystemLogger } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
++import type {
++  MemorySessionSyncTarget,
++  MemorySyncParams,
++} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
++import type { EmbeddingProvider } from "./embeddings.js";
++import { awaitPendingManagerWork } from "./manager-async-state.js";
++import { closeMemoryDatabase } from "./manager-db.js";
++import { MemorySearchOrchestration } from "./manager-search-orchestration.js";
++
++const log = createSubsystemLogger("memory");
++
++export abstract class MemoryManagerCloseLifecycle extends MemorySearchOrchestration {
++  private closePromise: Promise<void> | null = null;
++  private closeTeardownComplete = false;
++  protected closing = false;
++  protected activeManagerOperations = 0;
++  protected managerIdleWaiters = new Set<() => void>();
++  protected activeBackgroundSearchSyncs = new Set<Promise<void>>();
++  protected abstract override readonly cacheKey: string;
++  protected abstract queuedArchiveFiles: Set<string>;
++  protected abstract queuedSessions: Map<string, MemorySessionSyncTarget>;
++  protected abstract queuedForce: boolean;
++  protected abstract queuedProgressCallbacks: Set<NonNullable<MemorySyncParams["progress"]>>;
++  protected abstract syncing: Promise<void> | null;
++  protected abstract deleteManagerFromRegistry(): void;
++
++  async close(): Promise<void> {
++    const existingClose = this.closePromise;
++    if (existingClose) {
++      await existingClose;
++      return;
++    }
++    const closeOperation = this.withPublishedDatabase(() =>
++      this.closeTeardownComplete ? this.retryFailedClose() : this.closeOnce(),
++    );
++    this.closePromise = closeOperation;
++    try {
++      await closeOperation;
++    } catch (err) {
++      if (this.closePromise === closeOperation) {
++        this.closePromise = null;
++      }
++      throw err;
++    }
++  }
++
++  private async retryFailedClose(): Promise<void> {
++    const retirementErrors = await this.drainPendingProviderRetirements();
++    if (this.providersPendingRetirement.size > 0) {
++      throw toErrorObject(retirementErrors.at(-1), "Embedding provider retirement failed");
++    }
++    this.deleteManagerFromRegistry();
++  }
++
++  private async closeOnce(): Promise<void> {
++    this.closing = true;
++    this.queuedArchiveFiles.clear();
++    this.queuedSessions.clear();
++    this.queuedForce = false;
++    this.queuedProgressCallbacks.clear();
++    await this.awaitManagerIdle();
++    this.closed = true;
++    const pendingProviderInit = this.providerInitPromise;
++    const pendingFallbackInit = this.getPendingFallbackProviderInitialization();
++    if (this.watchTimer) {
++      clearTimeout(this.watchTimer);
++      this.watchTimer = null;
++    }
++    if (this.sessionWatchTimer) {
++      clearTimeout(this.sessionWatchTimer);
++      this.sessionWatchTimer = null;
++    }
++    if (this.intervalTimer) {
++      clearInterval(this.intervalTimer);
++      this.intervalTimer = null;
++    }
++    if (this.memoryWatchPressureStartupTimer) {
++      clearTimeout(this.memoryWatchPressureStartupTimer);
++      this.memoryWatchPressureStartupTimer = null;
++    }
++    if (this.watcher) {
++      await this.watcher.close();
++      this.watcher = null;
++    }
++    this.closeNativeMemoryWatchPairs();
++    if (this.sessionUnsubscribe) {
++      this.sessionUnsubscribe();
++      this.sessionUnsubscribe = null;
++    }
++    const closeErrors = new Map<EmbeddingProvider, unknown>();
++    // Sync/provider fallback may swap this.provider while close is awaiting.
++    // Keep every observed provider and drain the set after sync has settled.
++    const providersToClose = new Set<EmbeddingProvider>();
++    const rememberCurrentProvider = () => {
++      const provider = this.provider;
++      if (provider) {
++        providersToClose.add(provider);
++      }
++    };
++    const closeProvider = async (provider: EmbeddingProvider) => {
++      try {
++        await provider.close?.();
++        closeErrors.delete(provider);
++        if (this.provider === provider) {
++          this.provider = null;
++        }
++      } catch (err) {
++        closeErrors.set(provider, err);
++        providersToClose.add(provider);
++      } finally {
++        rememberCurrentProvider();
++      }
++    };
++    const drainTrackedProviders = async () => {
++      for (let attempt = 0; attempt < 2 && providersToClose.size > 0; attempt += 1) {
++        const providers = Array.from(providersToClose);
++        providersToClose.clear();
++        try {
++          for (const provider of providers) {
++            await closeProvider(provider);
++          }
++        } finally {
++          rememberCurrentProvider();
++        }
++      }
++    };
++    const reportPendingWorkError = (err: unknown) => {
++      logCloseFailure(err);
++    };
++    const awaitCurrentSync = async () => {
++      const pendingSync = this.syncing;
++      if (pendingSync) {
++        await awaitPendingManagerWork({ pendingSync, onError: reportPendingWorkError });
++      }
++    };
++    await awaitPendingManagerWork({ pendingProviderInit, onError: reportPendingWorkError });
++    await awaitPendingManagerWork({
++      pendingProviderInit: pendingFallbackInit?.then(() => undefined),
++      onError: reportPendingWorkError,
++    });
++    await awaitCurrentSync();
++    const retirementErrors = await this.drainPendingProviderRetirements();
++    rememberCurrentProvider();
++    try {
++      rememberCurrentProvider();
++      await drainTrackedProviders();
++    } finally {
++      closeMemoryDatabase(this.db);
++      this.closeTeardownComplete = true;
++    }
++    const closeError =
++      (this.providersPendingRetirement.size > 0 ? retirementErrors.at(-1) : undefined) ??
++      closeErrors.values().next().value;
++    if (closeError) {
++      throw toErrorObject(closeError, "Non-Error thrown");
++    }
++    this.deleteManagerFromRegistry();
++  }
++}
++
++function logCloseFailure(err: unknown): void {
++  log.warn(`memory close: pending manager work failed: ${formatErrorMessage(err)}`);
++}
+diff --git a/extensions/memory-core/src/memory/manager-db.test.ts b/extensions/memory-core/src/memory/manager-db.test.ts
+index 9286393bd3..4811d03fe3 100644
+--- a/extensions/memory-core/src/memory/manager-db.test.ts
++++ b/extensions/memory-core/src/memory/manager-db.test.ts
+@@ -7,8 +7,9 @@ import {
+   ensureMemoryIndexSchema,
+   loadSqliteVecExtension,
+ } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+-import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import {
++  assertMemorySearchDatabaseSchema,
+   cleanupAgedMemoryReindexTempFiles,
+   closeMemoryDatabase,
+   openMemoryDatabaseAtPath,
+@@ -52,6 +53,77 @@ describe("memory manager database publication", () => {
+     }
+   });
+ 
++  it("opens search databases read-only after owner and current-schema validation", () => {
++    const databasePath = path.join(fixtureRoot, "search.sqlite");
++    const writer = openMemoryDatabaseAtPath(databasePath, false, "main");
++    try {
++      ensureTestMemorySchema(writer, true, true);
++    } finally {
++      closeMemoryDatabase(writer);
++    }
++
++    const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
++    const reader = openMemoryDatabaseAtPath(databasePath, false, "main", true);
++    try {
++      assertMemorySearchDatabaseSchema(reader, { ftsEnabled: true });
++      expect(reader.prepare("PRAGMA query_only").get()).toEqual({ query_only: 1 });
++      expect(() => reader.exec("DELETE FROM memory_index_meta")).toThrow();
++      expect(prepare.mock.calls.some(([sql]) => /^\s*PRAGMA\s+integrity_check/iu.test(sql))).toBe(
++        false,
++      );
++    } finally {
++      prepare.mockRestore();
++      closeMemoryDatabase(reader);
++    }
++  });
++
++  it("keeps writable opens on the full schema path", () => {
++    const databasePath = path.join(fixtureRoot, "writer.sqlite");
++    const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
++    const writer = openMemoryDatabaseAtPath(databasePath, false, "main");
++    try {
++      expect(writer.prepare("PRAGMA query_only").get()).toEqual({ query_only: 0 });
++      expect(writer.prepare("PRAGMA user_version").get()).toEqual({ user_version: 19 });
++      expect(
++        writer.prepare("SELECT agent_id FROM schema_meta WHERE meta_key = 'primary'").get(),
++      ).toEqual({ agent_id: "main" });
++      expect(prepare.mock.calls.some(([sql]) => /^\s*PRAGMA\s+integrity_check/iu.test(sql))).toBe(
++        true,
++      );
++    } finally {
++      prepare.mockRestore();
++      closeMemoryDatabase(writer);
++    }
++  });
++
++  it("fails closed for stale schema, wrong owner, or incomplete search schema", () => {
++    const databasePath = path.join(fixtureRoot, "rejected-search.sqlite");
++    const writer = openMemoryDatabaseAtPath(databasePath, false, "main");
++    try {
++      ensureTestMemorySchema(writer, true, true);
++    } finally {
++      closeMemoryDatabase(writer);
++    }
++
++    expect(() => openMemoryDatabaseAtPath(databasePath, false, "peer", true)).toThrow(
++      /requested agent peer|owned by agent main/iu,
++    );
++
++    const stale = new DatabaseSync(databasePath);
++    stale.exec("PRAGMA user_version = 18");
++    stale.close();
++    expect(() => openMemoryDatabaseAtPath(databasePath, false, "main", true)).toThrow(
++      /schema version 18|migrate/iu,
++    );
++
++    const repair = new DatabaseSync(databasePath);
++    repair.exec("PRAGMA user_version = 19; DROP INDEX idx_memory_index_chunks_source");
++    repair.close();
++    expect(() => openMemoryDatabaseAtPath(databasePath, false, "main", true)).toThrow(
++      /missing or drifted index idx_memory_index_chunks_source/iu,
++    );
++  });
++
+   it("lazily adds recall metadata storage before publishing to an existing database", async () => {
+     const targetPath = path.join(fixtureRoot, "target.sqlite");
+     const sourcePath = path.join(fixtureRoot, "source.sqlite");
+diff --git a/extensions/memory-core/src/memory/manager-db.ts b/extensions/memory-core/src/memory/manager-db.ts
+index fa95f32790..61c4d3f7fc 100644
+--- a/extensions/memory-core/src/memory/manager-db.ts
++++ b/extensions/memory-core/src/memory/manager-db.ts
+@@ -15,6 +15,9 @@ import {
+   MEMORY_INDEX_PATHS_FTS_TABLE,
+ } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+ import {
++  assertCanonicalAgentPersistenceVersion,
++  assertOpenClawAgentCurrentRuntimeSchema,
++  assertSupportedAgentSchemaVersion,
+   ensureOpenClawAgentDatabaseSchema,
+   openNodeSqliteDatabase,
+   runSqliteImmediateTransactionSync,
+@@ -23,6 +26,7 @@ import {
+   tryAcquireMemoryReindexLock,
+   type MemoryReindexLockHandle,
+ } from "./manager-reindex-lock.js";
++import { resolvePersistedMemoryVectorIndexState } from "./manager-vector-rebuild-state.js";
+ 
+ const MEMORY_REINDEX_SCHEMA = "memory_reindex";
+ const MEMORY_INDEX_STATE_ID = 1;
+@@ -31,6 +35,20 @@ const MEMORY_REINDEX_ENTRY_SUFFIXES = ["-wal", "-shm", "-journal", ""] as const;
+ const MEMORY_REINDEX_UUID_PATTERN =
+   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+ const MEMORY_REINDEX_ORPHAN_MIN_AGE_MS = 24 * 60 * 60_000;
++const MEMORY_SEARCH_REQUIRED_TABLES = [
++  "memory_index_meta",
++  "memory_index_sources",
++  "memory_index_chunks",
++  "memory_index_chunk_recall_metadata",
++  "memory_index_chunk_provenance",
++  "memory_index_state",
++] as const;
++const MEMORY_SEARCH_REQUIRED_INDEXES = [
++  "idx_memory_index_sources_source",
++  "idx_memory_index_chunks_path_source",
++  "idx_memory_index_chunks_path",
++  "idx_memory_index_chunks_source",
++] as const;
+ 
+ export class MemoryIndexRevisionConflictError extends Error {
+   constructor(
+@@ -351,10 +369,26 @@ export function openMemoryDatabaseAtPath(
+   dbPath: string,
+   allowExtension: boolean,
+   agentId?: string,
++  readOnlySearch = false,
+ ): DatabaseSync {
+-  ensureDir(path.dirname(dbPath));
+-  const db = openNodeSqliteDatabase(dbPath, { allowExtension });
++  if (!readOnlySearch) {
++    ensureDir(path.dirname(dbPath));
++  }
++  const db = openNodeSqliteDatabase(dbPath, {
++    allowExtension,
++    ...(readOnlySearch ? { readOnly: true } : {}),
++  });
+   try {
++    if (readOnlySearch) {
++      if (!agentId) {
++        throw new Error("Read-only memory search requires an agent owner");
++      }
++      db.exec("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;");
++      const userVersion = assertSupportedAgentSchemaVersion(db, dbPath);
++      assertCanonicalAgentPersistenceVersion(db, dbPath, userVersion);
++      assertOpenClawAgentCurrentRuntimeSchema(db, { agentId, pathname: dbPath });
++      return db;
++    }
+     configureMemorySqliteWalMaintenance(db, {
+       busyTimeoutMs: 5000,
+       databasePath: dbPath,
+@@ -376,3 +410,87 @@ export function closeMemoryDatabase(db: DatabaseSync): void {
+   closeMemorySqliteWalMaintenance(db);
+   db.close();
+ }
++
++/** Validate the small, search-critical derived schema without repairing or mutating it. */
++export function assertMemorySearchDatabaseSchema(
++  db: DatabaseSync,
++  params: { ftsEnabled: boolean; ftsTokenizer?: "unicode61" | "trigram" },
++): void {
++  const required = [
++    ...MEMORY_SEARCH_REQUIRED_TABLES.map((name) => ({ type: "table", name })),
++    ...MEMORY_SEARCH_REQUIRED_INDEXES.map((name) => ({ type: "index", name })),
++    ...(params.ftsEnabled
++      ? [
++          { type: "table", name: "memory_index_chunks_fts" },
++          { type: "table", name: "memory_index_paths_fts" },
++        ]
++      : []),
++  ];
++  for (const entry of required) {
++    const row = db
++      .prepare("SELECT type FROM sqlite_schema WHERE name = ? COLLATE NOCASE")
++      // SAFETY: sqlite_schema projects dynamic rows; every consumed field is checked below.
++      .get(entry.name) as { type?: unknown } | undefined;
++    if (row?.type !== entry.type) {
++      throw new Error(
++        `Memory search database schema is incomplete: missing ${entry.type} ${entry.name}; run openclaw doctor --fix and rebuild the memory index.`,
++      );
++    }
++  }
++  const revision = db
++    .prepare("SELECT revision FROM memory_index_state WHERE id = ?")
++    // SAFETY: the untyped marker row is validated as a safe integer below.
++    .get(MEMORY_INDEX_STATE_ID) as { revision?: unknown } | undefined;
++  if (typeof revision?.revision !== "number" || !Number.isSafeInteger(revision.revision)) {
++    throw new Error("Memory search database revision marker is missing or invalid");
++  }
++  if (!params.ftsEnabled) {
++    return;
++  }
++  const expectedTokenizer = params.ftsTokenizer ?? "unicode61";
++  for (const tableName of ["memory_index_chunks_fts", "memory_index_paths_fts"]) {
++    const row = db
++      .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ? COLLATE NOCASE")
++      // SAFETY: sqlite_schema SQL is treated as unknown until the string guard below.
++      .get(tableName) as { sql?: unknown } | undefined;
++    const sql = typeof row?.sql === "string" ? row.sql.toLowerCase() : "";
++    const isFts5 = /\busing\s+fts5\s*\(/u.test(sql);
++    const tokenizerMatches =
++      expectedTokenizer === "trigram"
++        ? /tokenize\s*=\s*['"]trigram case_sensitive 0['"]/u.test(sql)
++        : !/tokenize\s*=\s*['"]trigram/u.test(sql);
++    if (!isFts5 || !tokenizerMatches) {
++      throw new Error(
++        `Memory search database FTS schema is incompatible for ${tableName}; rebuild the memory index.`,
++      );
++    }
++  }
++}
++
++export function assertMemorySearchIndexReady(params: {
++  db: DatabaseSync;
++  identity: { status: "valid" } | { status: "missing" | "mismatched"; reason: string };
++  vectorEnabled: boolean;
++  metaVectorDims?: number;
++  hasSemanticChunks: boolean;
++}): void {
++  if (params.identity.status !== "valid") {
++    throw new Error(
++      `Memory search index identity is ${params.identity.status}: ${params.identity.reason}`,
++    );
++  }
++  if (!params.vectorEnabled) {
++    return;
++  }
++  const vectorState = resolvePersistedMemoryVectorIndexState({
++    db: params.db,
++    vectorTable: "memory_index_chunks_vec",
++    metaVectorDims: params.metaVectorDims,
++    hasSemanticChunks: params.hasSemanticChunks,
++  }).state;
++  if (vectorState !== "complete" && vectorState !== "empty") {
++    throw new Error(
++      `Memory search vector index is ${vectorState}; run a writable memory index rebuild before searching.`,
++    );
++  }
++}
+diff --git a/extensions/memory-core/src/memory/manager-index.test-support.ts b/extensions/memory-core/src/memory/manager-index.test-support.ts
+index 4226d9b726..6ab14df265 100644
+--- a/extensions/memory-core/src/memory/manager-index.test-support.ts
++++ b/extensions/memory-core/src/memory/manager-index.test-support.ts
+@@ -104,7 +104,7 @@ export type ManagerIndexFixture = {
+   getPersistentManager: (cfg: ManagerConfig) => Promise<MemoryIndexManager>;
+   getFreshManager: (
+     cfg: ManagerConfig,
+-    purpose?: "default" | "status" | "cli",
++    purpose?: "default" | "status" | "cli" | "search",
+     inspectSources?: boolean,
+   ) => Promise<MemoryIndexManager>;
+   getFtsSessionManager: (params: { stateDirName: string }) => Promise<MemoryIndexManager | null>;
+@@ -476,7 +476,7 @@ export function createManagerIndexFixture(deps: {
+ 
+   const getFreshManager = async (
+     cfg: ManagerConfig,
+-    purpose?: "default" | "status" | "cli",
++    purpose?: "default" | "status" | "cli" | "search",
+     inspectSources?: boolean,
+   ): Promise<MemoryIndexManager> => {
+     const manager = requireManager(
+diff --git a/extensions/memory-core/src/memory/manager-provider-lifecycle.ts b/extensions/memory-core/src/memory/manager-provider-lifecycle.ts
+index a7e74189f7..d4f9d75b49 100644
+--- a/extensions/memory-core/src/memory/manager-provider-lifecycle.ts
++++ b/extensions/memory-core/src/memory/manager-provider-lifecycle.ts
+@@ -110,7 +110,12 @@ export function resolveMemoryEmbeddingProviderRequirement(params: {
+ 
+ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps {
+   protected abstract readonly cacheKey: string;
+-  protected abstract readonly purpose: "default" | "status" | "cli" | "maintenance";
++  protected abstract override readonly purpose:
++    | "default"
++    | "status"
++    | "cli"
++    | "search"
++    | "maintenance";
+   protected abstract readonly providerRequirement: MemoryEmbeddingProviderRequirement;
+   protected abstract readonly requestedProvider: EmbeddingProviderRequest;
+   protected abstract providerInitPromise: Promise<void> | null;
+@@ -218,7 +223,7 @@ export abstract class MemoryProviderLifecycle extends MemoryManagerEmbeddingOps
+ 
+     const currentIdentity = this.refreshIndexIdentityDirty({ providerKeyKnown: true });
+     let activeFailure = failure;
+-    if (currentIdentity.status !== "valid") {
++    if (currentIdentity.status !== "valid" && this.purpose !== "search") {
+       try {
+         await this.syncAdmitted({ reason: "search", force: true });
+       } catch (err) {
+diff --git a/extensions/memory-core/src/memory/manager-registry.test.ts b/extensions/memory-core/src/memory/manager-registry.test.ts
+index ececea4938..7351f729db 100644
+--- a/extensions/memory-core/src/memory/manager-registry.test.ts
++++ b/extensions/memory-core/src/memory/manager-registry.test.ts
+@@ -1,5 +1,6 @@
+ // Memory Core tests cover manager registry behavior.
+ import path from "node:path";
++import { DatabaseSync } from "node:sqlite";
+ import { describe, expect, it, vi } from "vitest";
+ import { createManagerIndexFixture } from "./manager-index.test-support.js";
+ import {
+@@ -18,6 +19,75 @@ describe("memory index", () => {
+   const { provider: providerFixture } = fixture;
+   const { createConfig: createCfg, getFreshManager, requireManager, trackManager } = fixture;
+ 
++  it("reuses read-only search alongside the persistent default writer", async () => {
++    const cfg = createCfg({ provider: "none", vectorEnabled: false });
++    const writer = requireManager(await getMemorySearchManager({ cfg, agentId: "main" }));
++    trackManager(writer);
++    await writer.sync({ force: true, reason: "test-search-cache" });
++
++    const first = requireManager(
++      await getMemorySearchManager({ cfg, agentId: "main", purpose: "search" }),
++    );
++    trackManager(first);
++    const second = requireManager(
++      await getMemorySearchManager({ cfg, agentId: "main", purpose: "search" }),
++    );
++    expect(second).toBe(first);
++    const retainedWriter = requireManager(await getMemorySearchManager({ cfg, agentId: "main" }));
++    expect(retainedWriter).toBe(writer);
++    expect(first).not.toBe(writer);
++    await expect(first.sync({ force: true })).rejects.toThrow(/read-only/iu);
++
++    await closeMemoryIndexManagersForAgent({ agentId: "main" });
++    const replacement = requireManager(
++      await getMemorySearchManager({ cfg, agentId: "main", purpose: "search" }),
++    );
++    trackManager(replacement);
++    expect(replacement === first).toBe(false);
++  });
++
++  it("fails closed when persisted memory index identity does not match", async () => {
++    const cfg = createCfg({ provider: "none", vectorEnabled: false });
++    const writer = requireManager(await getMemorySearchManager({ cfg, agentId: "main" }));
++    trackManager(writer);
++    await writer.sync({ force: true, reason: "test-search-identity" });
++    const databasePath = writer.status().dbPath!;
++    await writer.close();
++
++    const db = new DatabaseSync(databasePath);
++    const row = db
++      .prepare("SELECT value FROM memory_index_meta WHERE key = 'memory_index_meta_v1'")
++      .get() as { value: string };
++    db.prepare("UPDATE memory_index_meta SET value = ? WHERE key = 'memory_index_meta_v1'").run(
++      JSON.stringify({ ...JSON.parse(row.value), scopeHash: "wrong-scope" }),
++    );
++    db.close();
++
++    const rejected = await getMemorySearchManager({ cfg, agentId: "main", purpose: "search" });
++    expect(rejected.manager).toBeNull();
++    expect(rejected.error).toMatch(/identity is mismatched|index scope changed/iu);
++  });
++
++  it("fails closed when the persisted vector clean marker requires a rebuild", async () => {
++    const cfg = createCfg({ provider: "mock", vectorEnabled: true });
++    const writer = requireManager(await getMemorySearchManager({ cfg, agentId: "main" }));
++    trackManager(writer);
++    await writer.sync({ force: true, reason: "test-search-vector-clean-marker" });
++    const databasePath = writer.status().dbPath!;
++    await writer.close();
++
++    const db = new DatabaseSync(databasePath);
++    db.prepare(
++      `INSERT INTO memory_index_meta (key, value) VALUES ('memory_vector_rebuild_v1', '1')
++       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
++    ).run();
++    db.close();
++
++    const rejected = await getMemorySearchManager({ cfg, agentId: "main", purpose: "search" });
++    expect(rejected.manager).toBeNull();
++    expect(rejected.error).toMatch(/vector index is incomplete/iu);
++  });
++
+   it("waits for scoped manager close before initializing a replacement", async () => {
+     let releaseProviderClose: () => void = () => {};
+     providerFixture.providerCloseGate = new Promise<void>((resolve) => {
+diff --git a/extensions/memory-core/src/memory/manager-registry.ts b/extensions/memory-core/src/memory/manager-registry.ts
+index 00bb5b681c..893a806d21 100644
+--- a/extensions/memory-core/src/memory/manager-registry.ts
++++ b/extensions/memory-core/src/memory/manager-registry.ts
+@@ -19,12 +19,15 @@ const MEMORY_INDEX_MANAGER_GLOBAL_LIFECYCLE_KEY = Symbol.for(
+ );
+ const log = createSubsystemLogger("memory");
+ 
+-export type MemoryIndexManagerPurpose = "default" | "status" | "cli" | "maintenance";
++export type MemoryIndexManagerPurpose = "default" | "status" | "cli" | "search" | "maintenance";
+ 
+ export function normalizeMemoryIndexManagerPurpose(
+   purpose: MemoryIndexManagerPurpose | undefined,
+ ): MemoryIndexManagerPurpose {
+-  return purpose === "status" || purpose === "cli" || purpose === "maintenance"
++  return purpose === "status" ||
++    purpose === "cli" ||
++    purpose === "search" ||
++    purpose === "maintenance"
+     ? purpose
+     : "default";
+ }
+diff --git a/extensions/memory-core/src/memory/manager-search-orchestration.ts b/extensions/memory-core/src/memory/manager-search-orchestration.ts
+index 88ee4fa098..8f7f708dbf 100644
+--- a/extensions/memory-core/src/memory/manager-search-orchestration.ts
++++ b/extensions/memory-core/src/memory/manager-search-orchestration.ts
+@@ -86,7 +86,7 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
+         this.assertRequiredProviderAvailable("search");
+       }
+       let hasIndexedContent = this.hasIndexedContent();
+-      if (!hasIndexedContent) {
++      if (!hasIndexedContent && this.purpose !== "search") {
+         try {
+           // A fresh process can receive its first search before background watch/session
+           // syncs have built the index. Force one synchronous bootstrap so the first
+@@ -176,7 +176,7 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
+         : this.refreshIndexIdentityDirty({
+             providerKeyKnown: this.providerInitialized,
+           });
+-      if (indexIdentity.status === "missing" && hasIndexedContent) {
++      if (indexIdentity.status === "missing" && hasIndexedContent && this.purpose !== "search") {
+         // Missing metadata cannot identify a safe published generation. Repair it
+         // synchronously before a detached handoff or a read-generation lease.
+         await this.syncAdmitted(
+diff --git a/extensions/memory-core/src/memory/manager-sync-base.ts b/extensions/memory-core/src/memory/manager-sync-base.ts
+index 275b7d8246..d9106a719a 100644
+--- a/extensions/memory-core/src/memory/manager-sync-base.ts
++++ b/extensions/memory-core/src/memory/manager-sync-base.ts
+@@ -48,6 +48,7 @@ import {
+   markMemoryVectorRebuildRequired,
+   memoryTableExists,
+   requiresMemoryVectorRebuild,
++  resolvePersistedMemoryVectorIndexState,
+ } from "./manager-vector-rebuild-state.js";
+ import { buildMemorySourceFilter } from "./source-filter.js";
+ import type { MemoryWatchSettleQueue } from "./watch-settle.js";
+@@ -155,6 +156,7 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
+   protected sessionPendingTargets = new Map<string, MemorySessionSyncTarget>();
+ 
+   protected abstract readonly cache: { enabled: boolean; maxEntries?: number };
++  protected abstract readonly purpose: "default" | "status" | "cli" | "search" | "maintenance";
+   protected abstract computeProviderKey(): string;
+   protected abstract resolveProviderIndexIdentities(): MemoryIndexProviderIdentity[];
+   protected abstract sync(params?: MemorySyncParams): Promise<void>;
+@@ -479,7 +481,13 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
+       if (persistedMeta && persistedMeta.vectorDims !== this.vector.dims) {
+         this.vector.dims = persistedMeta.vectorDims;
+       }
+-      this.ensureVectorTable(dimensions);
++      if (this.purpose === "search") {
++        if (this.vector.dims !== dimensions || !memoryTableExists(this.db, VECTOR_TABLE)) {
++          return false;
++        }
++      } else {
++        this.ensureVectorTable(dimensions);
++      }
+     }
+     return ready;
+   }
+@@ -506,6 +514,15 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
+       }
+       this.vector.extensionPath = loaded.extensionPath;
+       this.vector.available = true;
++      if (this.purpose === "search") {
++        const state = resolvePersistedMemoryVectorIndexState({
++          db: this.db,
++          vectorTable: VECTOR_TABLE,
++          metaVectorDims: this.readMeta()?.vectorDims,
++          hasSemanticChunks: this.hasSemanticChunks(),
++        }).state;
++        return state === "complete" || state === "empty";
++      }
+       if (this.hasVectorRebuildMarker()) {
+         // A skipped vector write/delete can leave both missing and extra rows.
+         // Refuse partial KNN results and let the normal shadow reindex rebuild all
+@@ -626,7 +643,12 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
+ 
+   protected openDatabase(): DatabaseSync {
+     const dbPath = resolveUserPath(this.settings.store.databasePath);
+-    return openMemoryDatabaseAtPath(dbPath, this.settings.store.vector.enabled, this.agentId);
++    return openMemoryDatabaseAtPath(
++      dbPath,
++      this.settings.store.vector.enabled,
++      this.agentId,
++      this.purpose === "search",
++    );
+   }
+ 
+   protected async seedEmbeddingCache(sourceDb: DatabaseSync): Promise<void> {
+diff --git a/extensions/memory-core/src/memory/manager.self-heal-missing-identity.test.ts b/extensions/memory-core/src/memory/manager.self-heal-missing-identity.test.ts
+index 9b1e0d6913..68994cefdf 100644
+--- a/extensions/memory-core/src/memory/manager.self-heal-missing-identity.test.ts
++++ b/extensions/memory-core/src/memory/manager.self-heal-missing-identity.test.ts
+@@ -92,7 +92,7 @@ describe("memory manager self-heal missing identity with FTS-only chunks", () =>
+     params: {
+       provider?: string;
+       vectorEnabled?: boolean;
+-      purpose?: "default" | "status" | "cli";
++      purpose?: "default" | "status" | "cli" | "search";
+     } = {},
+   ): Promise<MemoryIndexManager> {
+     const store =
+diff --git a/extensions/memory-core/src/memory/manager.ts b/extensions/memory-core/src/memory/manager.ts
+index c3fdeac139..d7a5c30f0b 100644
+--- a/extensions/memory-core/src/memory/manager.ts
++++ b/extensions/memory-core/src/memory/manager.ts
+@@ -1,7 +1,5 @@
+ // Memory Core plugin module implements the concrete memory index manager.
+-import { formatErrorMessage, toErrorObject } from "openclaw/plugin-sdk/error-runtime";
+ import {
+-  createSubsystemLogger,
+   resolveAgentWorkspaceDir,
+   resolveMemorySearchConfig,
+   type OpenClawConfig,
+@@ -21,10 +19,14 @@ import {
+ import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
+ import type { MemoryCoreAcquireLocalService } from "./embedding-local-service.js";
+ import type { EmbeddingProvider, EmbeddingProviderRequest } from "./embeddings.js";
+-import { awaitPendingManagerWork } from "./manager-async-state.js";
+ import { MEMORY_BATCH_FAILURE_LIMIT } from "./manager-batch-state.js";
++import { MemoryManagerCloseLifecycle } from "./manager-close-lifecycle.js";
+ import { MemoryIndexDatabase } from "./manager-database-context.js";
+-import { closeMemoryDatabase } from "./manager-db.js";
++import {
++  assertMemorySearchDatabaseSchema,
++  assertMemorySearchIndexReady,
++  closeMemoryDatabase,
++} from "./manager-db.js";
+ import {
+   clearMemoryEmbeddingProbeCache,
+   resolveEffectiveMemorySearchSettings,
+@@ -45,7 +47,6 @@ import {
+ } from "./manager-registry.js";
+ import type { MemoryIndexIdentityState } from "./manager-reindex-state.js";
+ import { runMemorySearchMaintenance } from "./manager-search-maintenance.js";
+-import { MemorySearchOrchestration } from "./manager-search-orchestration.js";
+ import {
+   collectMemoryStatusAggregate,
+   resolveInitialMemoryDirty,
+@@ -57,7 +58,6 @@ import {
+ } from "./manager-sync-control.js";
+ import { resolvePersistedMemoryVectorIndexState } from "./manager-vector-rebuild-state.js";
+ 
+-const log = createSubsystemLogger("memory");
+ const INDEX_MANAGER_REGISTRY = new MemoryManagerRegistry<MemoryIndexManager>();
+ 
+ export async function closeAllMemoryIndexManagers(): Promise<void> {
+@@ -76,10 +76,15 @@ export async function closeMemoryIndexManagersForAgent(params: { agentId: string
+     purpose: "maintenance",
+     close: async (manager) => await manager.close(),
+   });
++  await INDEX_MANAGER_REGISTRY.closeForAgent({
++    agentId: params.agentId,
++    purpose: "search",
++    close: async (manager) => await manager.close(),
++  });
+ }
+ 
+-export class MemoryIndexManager extends MemorySearchOrchestration implements MemorySearchManager {
+-  protected readonly cacheKey: string;
++export class MemoryIndexManager extends MemoryManagerCloseLifecycle implements MemorySearchManager {
++  protected override readonly cacheKey: string;
+   protected readonly purpose: MemoryIndexManagerPurpose;
+   protected override readonly acquireLocalService?: MemoryCoreAcquireLocalService;
+   protected readonly cfg: OpenClawConfig;
+@@ -93,12 +98,6 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
+   protected embeddingBootstrapFailure?: MemoryEmbeddingBootstrapDebug;
+   protected providerRetirementPromise: Promise<void> = Promise.resolve();
+   protected providersPendingRetirement = new Set<EmbeddingProvider>();
+-  private closePromise: Promise<void> | null = null;
+-  private closeTeardownComplete = false;
+-  protected closing = false;
+-  protected activeManagerOperations = 0;
+-  protected managerIdleWaiters = new Set<() => void>();
+-  protected activeBackgroundSearchSyncs = new Set<Promise<void>>();
+   protected providerUnavailableReason?: string;
+   protected override providerLifecycle: MemoryProviderLifecycleState;
+   protected batch: {
+@@ -116,11 +115,11 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
+   protected readonly cache: { enabled: boolean; maxEntries?: number };
+   protected indexIdentityDirty = false;
+   protected sessionWarm = new Set<string>();
+-  private syncing: Promise<void> | null = null;
+-  private queuedArchiveFiles = new Set<string>();
+-  private queuedSessions = new Map<string, MemorySessionSyncTarget>();
+-  private queuedForce = false;
+-  private queuedProgressCallbacks = new Set<NonNullable<MemorySyncParams["progress"]>>();
++  protected override syncing: Promise<void> | null = null;
++  protected override queuedArchiveFiles = new Set<string>();
++  protected override queuedSessions = new Map<string, MemorySessionSyncTarget>();
++  protected override queuedForce = false;
++  protected override queuedProgressCallbacks = new Set<NonNullable<MemorySyncParams["progress"]>>();
+   private queuedSessionSync: Promise<void> | null = null;
+   protected indexIdentityState: MemoryIndexIdentityState = {
+     status: "missing",
+@@ -218,7 +217,15 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
+         maxEntries: effectiveSettings.cache.maxEntries,
+       };
+       this.fts.enabled = effectiveSettings.query.hybrid.enabled;
+-      this.ensureSchema();
++      if (this.purpose === "search") {
++        assertMemorySearchDatabaseSchema(this.db, {
++          ftsEnabled: this.fts.enabled,
++          ftsTokenizer: this.settings.store.fts.tokenizer,
++        });
++        this.fts.available = this.fts.enabled;
++      } else {
++        this.ensureSchema();
++      }
+       this.vector.enabled = effectiveSettings.store.vector.enabled;
+       this.vector.extensionPath = effectiveSettings.store.vector.extensionPath;
+       const meta = this.readMeta();
+@@ -230,11 +237,23 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
+         providerKeyKnown: false,
+       });
+       this.indexIdentityState = initialIndexIdentity;
++      if (this.purpose === "search") {
++        assertMemorySearchIndexReady({
++          db: this.db,
++          identity: initialIndexIdentity,
++          vectorEnabled: this.vector.enabled,
++          metaVectorDims: meta?.vectorDims,
++          hasSemanticChunks: this.hasSemanticChunks(),
++        });
++      }
+       this.indexIdentityDirty =
+         initialIndexIdentity.status === "mismatched" ||
+         (initialIndexIdentity.status === "missing" && this.sources.has("memory"));
+       const transient =
+-        params.purpose === "status" || params.purpose === "cli" || params.purpose === "maintenance";
++        params.purpose === "status" ||
++        params.purpose === "cli" ||
++        params.purpose === "search" ||
++        params.purpose === "maintenance";
+       if (!transient) {
+         this.ensureWatcher();
+         this.ensureSessionListener();
+@@ -275,6 +294,9 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
+   }
+ 
+   async sync(params?: MemorySyncParams): Promise<void> {
++    if (this.purpose === "search") {
++      throw new Error("Read-only memory search manager cannot sync or mutate the index");
++    }
+     return await this.withPublishedDatabase(() => this.syncPublished(params));
+   }
+ 
+@@ -320,6 +342,9 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
+       queuedSessionOwner?: boolean;
+     },
+   ): Promise<void> {
++    if (this.purpose === "search") {
++      throw new Error("Read-only memory search manager cannot sync or mutate the index");
++    }
+     if (this.syncing) {
+       if (hasTargetedSessionSyncParams(params)) {
+         if (options?.queuedSessionOwner) {
+@@ -575,144 +600,7 @@ export class MemoryIndexManager extends MemorySearchOrchestration implements Mem
+     };
+   }
+ 
+-  async close(): Promise<void> {
+-    const existingClose = this.closePromise;
+-    if (existingClose) {
+-      await existingClose;
+-      return;
+-    }
+-    const closeOperation = this.withPublishedDatabase(() =>
+-      this.closeTeardownComplete ? this.retryFailedClose() : this.closeOnce(),
+-    );
+-    this.closePromise = closeOperation;
+-    try {
+-      await closeOperation;
+-    } catch (err) {
+-      if (this.closePromise === closeOperation) {
+-        this.closePromise = null;
+-      }
+-      throw err;
+-    }
+-  }
+-
+-  private async retryFailedClose(): Promise<void> {
+-    const retirementErrors = await this.drainPendingProviderRetirements();
+-    if (this.providersPendingRetirement.size > 0) {
+-      throw toErrorObject(retirementErrors.at(-1), "Embedding provider retirement failed");
+-    }
+-    INDEX_MANAGER_REGISTRY.deleteIfCurrent(this.cacheKey, this);
+-  }
+-
+-  private async closeOnce(): Promise<void> {
+-    this.closing = true;
+-    this.queuedArchiveFiles.clear();
+-    this.queuedSessions.clear();
+-    this.queuedForce = false;
+-    this.queuedProgressCallbacks.clear();
+-    await this.awaitManagerIdle();
+-    this.closed = true;
+-    const pendingProviderInit = this.providerInitPromise;
+-    const pendingFallbackInit = this.getPendingFallbackProviderInitialization();
+-    if (this.watchTimer) {
+-      clearTimeout(this.watchTimer);
+-      this.watchTimer = null;
+-    }
+-    if (this.sessionWatchTimer) {
+-      clearTimeout(this.sessionWatchTimer);
+-      this.sessionWatchTimer = null;
+-    }
+-    if (this.intervalTimer) {
+-      clearInterval(this.intervalTimer);
+-      this.intervalTimer = null;
+-    }
+-    if (this.memoryWatchPressureStartupTimer) {
+-      clearTimeout(this.memoryWatchPressureStartupTimer);
+-      this.memoryWatchPressureStartupTimer = null;
+-    }
+-    if (this.watcher) {
+-      await this.watcher.close();
+-      this.watcher = null;
+-    }
+-    this.closeNativeMemoryWatchPairs();
+-    if (this.sessionUnsubscribe) {
+-      this.sessionUnsubscribe();
+-      this.sessionUnsubscribe = null;
+-    }
+-    const closeErrors = new Map<EmbeddingProvider, unknown>();
+-    // Sync/provider fallback may swap this.provider while close is awaiting.
+-    // Keep every observed provider and drain the set after sync has settled.
+-    const providersToClose = new Set<EmbeddingProvider>();
+-    const rememberCurrentProvider = () => {
+-      const provider = this.provider;
+-      if (!provider) {
+-        return;
+-      }
+-      providersToClose.add(provider);
+-    };
+-    const closeProvider = async (provider: EmbeddingProvider) => {
+-      try {
+-        await provider.close?.();
+-        closeErrors.delete(provider);
+-        if (this.provider === provider) {
+-          this.provider = null;
+-        }
+-      } catch (err) {
+-        closeErrors.set(provider, err);
+-        providersToClose.add(provider);
+-      } finally {
+-        rememberCurrentProvider();
+-      }
+-    };
+-    const drainTrackedProviders = async () => {
+-      for (let attempt = 0; attempt < 2 && providersToClose.size > 0; attempt += 1) {
+-        const providers = Array.from(providersToClose);
+-        providersToClose.clear();
+-        try {
+-          for (const provider of providers) {
+-            await closeProvider(provider);
+-          }
+-        } finally {
+-          rememberCurrentProvider();
+-        }
+-      }
+-    };
+-    const reportPendingWorkError = (err: unknown) => {
+-      log.warn(`memory close: pending manager work failed: ${formatErrorMessage(err)}`);
+-    };
+-    const awaitCurrentSync = async () => {
+-      const pendingSync = this.syncing;
+-      if (!pendingSync) {
+-        return;
+-      }
+-      await awaitPendingManagerWork({
+-        pendingSync,
+-        onError: reportPendingWorkError,
+-      });
+-    };
+-    await awaitPendingManagerWork({
+-      pendingProviderInit,
+-      onError: reportPendingWorkError,
+-    });
+-    await awaitPendingManagerWork({
+-      pendingProviderInit: pendingFallbackInit?.then(() => undefined),
+-      onError: reportPendingWorkError,
+-    });
+-    await awaitCurrentSync();
+-    const retirementErrors = await this.drainPendingProviderRetirements();
+-    rememberCurrentProvider();
+-    try {
+-      rememberCurrentProvider();
+-      await drainTrackedProviders();
+-    } finally {
+-      closeMemoryDatabase(this.db);
+-      this.closeTeardownComplete = true;
+-    }
+-    const closeError =
+-      (this.providersPendingRetirement.size > 0 ? retirementErrors.at(-1) : undefined) ??
+-      closeErrors.values().next().value;
+-    if (closeError) {
+-      throw toErrorObject(closeError, "Non-Error thrown");
+-    }
++  protected deleteManagerFromRegistry(): void {
+     INDEX_MANAGER_REGISTRY.deleteIfCurrent(this.cacheKey, this);
+   }
+ }
+diff --git a/extensions/memory-core/src/memory/search-deadline.test.ts b/extensions/memory-core/src/memory/search-deadline.test.ts
+index cf3ac054cd..4bb81b65af 100644
+--- a/extensions/memory-core/src/memory/search-deadline.test.ts
++++ b/extensions/memory-core/src/memory/search-deadline.test.ts
+@@ -1,11 +1,19 @@
+ import { afterEach, describe, expect, it, vi } from "vitest";
+-import { isMemorySearchDeadlineError, runMemorySearchWithDeadline } from "./search-deadline.js";
++import {
++  DEFAULT_MEMORY_SEARCH_TIMEOUT_MS,
++  isMemorySearchDeadlineError,
++  runMemorySearchWithDeadline,
++} from "./search-deadline.js";
+ 
+ describe("runMemorySearchWithDeadline", () => {
+   afterEach(() => {
+     vi.useRealTimers();
+   });
+ 
++  it("allows the default memory_search envelope thirty seconds", () => {
++    expect(DEFAULT_MEMORY_SEARCH_TIMEOUT_MS).toBe(30_000);
++  });
++
+   it("clears its timer and parent abort listener after success", async () => {
+     vi.useFakeTimers();
+     const parent = new AbortController();
+diff --git a/extensions/memory-core/src/memory/search-deadline.ts b/extensions/memory-core/src/memory/search-deadline.ts
+index ec33a5ae53..cfa338a8e0 100644
+--- a/extensions/memory-core/src/memory/search-deadline.ts
++++ b/extensions/memory-core/src/memory/search-deadline.ts
+@@ -1,4 +1,4 @@
+-export const DEFAULT_MEMORY_SEARCH_TIMEOUT_MS = 15_000;
++export const DEFAULT_MEMORY_SEARCH_TIMEOUT_MS = 30_000;
+ export function resolveMemorySearchAbortError(signal: AbortSignal): Error {
+   const { reason } = signal;
+   if (reason instanceof Error) {
+diff --git a/extensions/memory-core/src/memory/search-manager.ts b/extensions/memory-core/src/memory/search-manager.ts
+index 2762f2a799..17888de789 100644
+--- a/extensions/memory-core/src/memory/search-manager.ts
++++ b/extensions/memory-core/src/memory/search-manager.ts
+@@ -9,7 +9,7 @@ import type { MemoryCoreAcquireLocalService } from "./embedding-local-service.js
+ const managerRuntimeLoader = createLazyRuntimeModule(() => import("../../manager-runtime.js"));
+ const loadManagerRuntime = managerRuntimeLoader;
+ 
+-type MemorySearchManagerPurpose = "default" | "status" | "cli";
++type MemorySearchManagerPurpose = "default" | "status" | "cli" | "search";
+ type MemorySearchManagerParams = {
+   cfg: OpenClawConfig;
+   agentId: string;
+diff --git a/extensions/memory-core/src/tools.citations.test.ts b/extensions/memory-core/src/tools.citations.test.ts
+index a470756e83..9b8fa9a864 100644
+--- a/extensions/memory-core/src/tools.citations.test.ts
++++ b/extensions/memory-core/src/tools.citations.test.ts
+@@ -154,7 +154,7 @@ describe("memory tools", () => {
+     });
+   });
+ 
+-  it("uses default memory manager mode for shared memory_search", async () => {
++  it("uses the reusable read-only manager for shared memory_search", async () => {
+     const tool = createMemorySearchToolOrThrow({
+       config: asOpenClawConfig({
+         agents: { list: [{ id: "main", default: true }] },
+@@ -166,7 +166,7 @@ describe("memory tools", () => {
+     expect(getMemorySearchManagerMockParams()).toEqual([
+       expect.objectContaining({
+         agentId: "main",
+-        purpose: undefined,
++        purpose: "search",
+       }),
+     ]);
+     expect(getMemoryCloseMockCalls()).toBe(0);
+@@ -637,7 +637,7 @@ describe("memory tools", () => {
+         query: "alpha",
+         corpus: "all",
+       });
+-      await vi.advanceTimersByTimeAsync(15_000);
++      await vi.advanceTimersByTimeAsync(30_000);
+       const stalledAllResult = await stalledAllResultPromise;
+       expect(stalledAllResult.details).toMatchObject({
+         results: [{ corpus: "memory", path: "MEMORY.md" }],
+@@ -646,7 +646,7 @@ describe("memory tools", () => {
+           {
+             corpus: "wiki",
+             outcome: "unavailable",
+-            error: "memory_search timed out after 15s",
++            error: "memory_search timed out after 30s",
+           },
+         ],
+         warning: expect.stringContaining("Wiki corpus unavailable"),
+@@ -738,7 +738,7 @@ describe("memory tools", () => {
+         query: "alpha",
+         corpus: "all",
+       });
+-      await vi.advanceTimersByTimeAsync(15_000);
++      await vi.advanceTimersByTimeAsync(30_000);
+       const stalledAllResult = await stalledAllResultPromise;
+       expect(stalledAllResult.details).toMatchObject({
+         results: [{ corpus: "wiki", path: "entities/alpha.md" }],
+@@ -746,7 +746,7 @@ describe("memory tools", () => {
+           {
+             corpus: "memory",
+             outcome: "unavailable",
+-            error: "memory_search timed out after 15s",
++            error: "memory_search timed out after 30s",
+           },
+           { corpus: "wiki", outcome: "ok" },
+         ],
+@@ -769,12 +769,12 @@ describe("memory tools", () => {
+         {
+           corpus: "memory",
+           outcome: "unavailable",
+-          error: "memory_search timed out after 15s",
++          error: "memory_search timed out after 30s",
+         },
+         { corpus: "wiki", outcome: "ok" },
+       ]);
+       expect(details.warning).toContain("Memory corpus unavailable");
+-      expect(details.warning).toContain("memory_search timed out after 15s");
++      expect(details.warning).toContain("memory_search timed out after 30s");
+       expect(searchCalls).toBe(1);
+     } finally {
+       vi.useRealTimers();
+diff --git a/extensions/memory-core/src/tools.real-manager.test.ts b/extensions/memory-core/src/tools.real-manager.test.ts
+index 4cc169d0f4..84f7356024 100644
+--- a/extensions/memory-core/src/tools.real-manager.test.ts
++++ b/extensions/memory-core/src/tools.real-manager.test.ts
+@@ -60,25 +60,13 @@ describe("memory_search real manager", () => {
+     });
+     Reflect.set(manager, "sessionsDirty", true);
+ 
+-    const maintenanceReady = createDeferred<void>();
+-    const releaseMaintenance = createDeferred<void>();
+     const originalGet = MemoryIndexManager.get.bind(MemoryIndexManager);
++    let maintenanceAcquisitions = 0;
+     const getSpy = vi.spyOn(MemoryIndexManager, "get").mockImplementation(async (params) => {
+-      const acquired = await originalGet(params);
+-      if (params.purpose !== "maintenance" || !acquired) {
+-        return acquired;
++      if (params.purpose === "maintenance") {
++        maintenanceAcquisitions += 1;
+       }
+-      const fields = acquired as unknown as {
+-        syncArchiveFiles: (params: { needsFullReindex: boolean }) => Promise<unknown>;
+-      };
+-      const syncArchiveFiles = fields.syncArchiveFiles.bind(acquired);
+-      vi.spyOn(fields, "syncArchiveFiles").mockImplementation(async (syncParams) => {
+-        const result = await syncArchiveFiles(syncParams);
+-        maintenanceReady.resolve();
+-        await releaseMaintenance.promise;
+-        return result;
+-      });
+-      return acquired;
++      return await originalGet(params);
+     });
+ 
+     try {
+@@ -94,7 +82,6 @@ describe("memory_search real manager", () => {
+         query: "zebra",
+         corpus: "memory",
+       });
+-      await maintenanceReady.promise;
+       const result = await execution;
+ 
+       expect(result.details).toMatchObject({
+@@ -103,14 +90,16 @@ describe("memory_search real manager", () => {
+       expect(result.details).not.toHaveProperty("stale");
+       expect(result.details).not.toHaveProperty("warning");
+       expect(result.details).not.toHaveProperty("action");
++      expect(maintenanceAcquisitions).toBe(0);
++      expect(manager.status().dirty).toBe(true);
+     } finally {
+-      releaseMaintenance.resolve();
+       getSpy.mockRestore();
+     }
+   });
+ 
+   it("backfills visible sessions with one bounded query embedding", async () => {
+     const baseConfig = fixture.createConfig({
++      provider: "mock",
+       sources: ["sessions"],
+       sessionMemory: true,
+       minScore: 0,
+@@ -202,6 +191,7 @@ describe("memory_search real manager", () => {
+ 
+   it("preserves canonical-session migration recovery through cooldown", async () => {
+     const baseConfig = fixture.createConfig({
++      provider: "mock",
+       sources: ["sessions"],
+       sessionMemory: true,
+       minScore: 0,
+@@ -312,7 +302,7 @@ describe("memory_search real manager", () => {
+     });
+     try {
+       await searchStarted.promise;
+-      await vi.advanceTimersByTimeAsync(15_100);
++      await vi.advanceTimersByTimeAsync(30_100);
+       expect(executionSettled).toBe(true);
+       await expect(execution).resolves.toMatchObject({
+         details: { unavailable: true },
+diff --git a/extensions/memory-core/src/tools.shared.ts b/extensions/memory-core/src/tools.shared.ts
+index 6770aac724..e6a6f5725c 100644
+--- a/extensions/memory-core/src/tools.shared.ts
++++ b/extensions/memory-core/src/tools.shared.ts
+@@ -28,7 +28,7 @@ export const loadMemoryToolRuntime = createLazyRuntimeModule(() => import("./too
+ export async function getMemoryManagerContextWithPurpose(params: {
+   cfg: OpenClawConfig;
+   agentId: string;
+-  purpose?: "default" | "status" | "cli";
++  purpose?: "default" | "status" | "cli" | "search";
+   acquireLocalService?: MemoryCoreAcquireLocalService;
+ }): Promise<
+   | {
+@@ -105,6 +105,10 @@ export function buildMemorySearchUnavailableResult(
+   const isMissingNodeSqlite = /missing node:sqlite|no such built-?in module: node:sqlite/.test(
+     normalizedReason,
+   );
++  const isIndexNotReady =
++    /memory search (?:database schema|index identity|vector index)|schema version .*migrat/.test(
++      normalizedReason,
++    );
+   // Provenance from the deadline owner, never the message text: a provider
+   // error can read exactly like this tool's timeout.
+   const isSearchDeadline = overrides?.deadline === true;
+@@ -119,9 +123,11 @@ export function buildMemorySearchUnavailableResult(
+         ? "Memory search is unavailable because the embedding provider quota is exhausted."
+         : isMissingNodeSqlite
+           ? "Memory search is unavailable because this OpenClaw Node runtime does not provide SQLite support."
+-          : isSearchDeadline
+-            ? "Memory search did not finish within its time limit."
+-            : "Memory search is unavailable due to an embedding/provider error.");
++          : isIndexNotReady
++            ? "Memory search is unavailable because the read-only index is not ready."
++            : isSearchDeadline
++              ? "Memory search did not finish within its time limit."
++              : "Memory search is unavailable due to an embedding/provider error.");
+   const action =
+     overrides?.action ??
+     (overrides?.code === SESSION_CANONICAL_KEY_MIGRATION_REQUIRED
+@@ -130,9 +136,11 @@ export function buildMemorySearchUnavailableResult(
+         ? "Top up or switch embedding provider, then retry memory_search."
+         : isMissingNodeSqlite
+           ? "Run OpenClaw with a Node runtime that includes node:sqlite, then retry memory_search."
+-          : isSearchDeadline
+-            ? deadlineAction
+-            : "Check embedding provider configuration and retry memory_search.");
++          : isIndexNotReady
++            ? "Keep the default memory writer running, inspect with openclaw memory status --deep for this agent, and rebuild only if it reports the index dirty or incomplete."
++            : isSearchDeadline
++              ? deadlineAction
++              : "Check embedding provider configuration and retry memory_search.");
+   return {
+     results: [],
+     disabled: true,
+diff --git a/extensions/memory-core/src/tools.test.ts b/extensions/memory-core/src/tools.test.ts
+index 741b29b7b4..9b8a4af9d8 100644
+--- a/extensions/memory-core/src/tools.test.ts
++++ b/extensions/memory-core/src/tools.test.ts
+@@ -291,6 +291,20 @@ describe("memory_search unavailable payloads", () => {
+     });
+   });
+ 
++  it("returns actionable recovery when the read-only search index is not ready", async () => {
++    const error = "Memory search index identity is mismatched: index scope changed";
++    setMemorySearchManagerImpl(async () => ({ error }));
++
++    const tool = createMemorySearchToolOrThrow();
++    const result = await tool.execute("index-not-ready", { query: "hello" });
++    expectUnavailableMemorySearchDetails(result.details, {
++      error,
++      warning: "Memory search is unavailable because the read-only index is not ready.",
++      action:
++        "Keep the default memory writer running, inspect with openclaw memory status --deep for this agent, and rebuild only if it reports the index dirty or incomplete.",
++    });
++  });
++
+   it("separates this tool's deadline from a provider error by provenance, not text", () => {
+     // Same text, opposite guidance: only the caller's deadline flag decides.
+     expect(
+@@ -352,11 +366,11 @@ describe("memory_search unavailable payloads", () => {
+       const tool = createMemorySearchToolOrThrow();
+ 
+       const resultPromise = tool.execute("search-timeout", { query: "hello" });
+-      await vi.advanceTimersByTimeAsync(15_000);
++      await vi.advanceTimersByTimeAsync(30_000);
+ 
+       const result = await resultPromise;
+       expectUnavailableMemorySearchDetails(result.details, {
+-        error: "memory_search timed out after 15s",
++        error: "memory_search timed out after 30s",
+         warning: "Memory search did not finish within its time limit.",
+         action:
+           "Retry memory_search after a short wait: a memory-corpus timeout pauses retries for up to a minute. If memory-corpus timeouts persist, run: openclaw memory status --deep --agent main, and rebuild with openclaw memory index --force --agent main only if it reports the index dirty or incomplete",
+@@ -365,7 +379,7 @@ describe("memory_search unavailable payloads", () => {
+       expect(searchSignal?.aborted).toBe(true);
+       const cooldownResult = await tool.execute("search-cooldown", { query: "hello again" });
+       expectUnavailableMemorySearchDetails(cooldownResult.details, {
+-        error: "memory_search timed out after 15s",
++        error: "memory_search timed out after 30s",
+         warning: "Memory search did not finish within its time limit.",
+         action:
+           "Retry memory_search after a short wait: a memory-corpus timeout pauses retries for up to a minute. If memory-corpus timeouts persist, run: openclaw memory status --deep --agent main, and rebuild with openclaw memory index --force --agent main only if it reports the index dirty or incomplete",
+@@ -392,11 +406,11 @@ describe("memory_search unavailable payloads", () => {
+       const tool = createMemorySearchToolOrThrow();
+ 
+       const resultPromise = tool.execute("abort-aware-timeout", { query: "hello" });
+-      await vi.advanceTimersByTimeAsync(15_000);
++      await vi.advanceTimersByTimeAsync(30_000);
+ 
+       const result = await resultPromise;
+       expectUnavailableMemorySearchDetails(result.details, {
+-        error: "memory_search timed out after 15s",
++        error: "memory_search timed out after 30s",
+         warning: "Memory search did not finish within its time limit.",
+         action:
+           "Retry memory_search after a short wait: a memory-corpus timeout pauses retries for up to a minute. If memory-corpus timeouts persist, run: openclaw memory status --deep --agent main, and rebuild with openclaw memory index --force --agent main only if it reports the index dirty or incomplete",
+@@ -511,8 +525,8 @@ describe("memory_search unavailable payloads", () => {
+     expect(searchCalls).toBe(2);
+     expect(getMemorySearchManagerMockCalls()).toBe(2);
+     expect(getMemorySearchManagerMockParams()).toEqual([
+-      expect.objectContaining({ purpose: undefined }),
+-      expect.objectContaining({ purpose: undefined }),
++      expect.objectContaining({ purpose: "search" }),
++      expect.objectContaining({ purpose: "search" }),
+     ]);
+     expect(getMemoryCloseMockCalls()).toBe(0);
+   });
+diff --git a/extensions/memory-core/src/tools.ts b/extensions/memory-core/src/tools.ts
+index 262eb03e20..4a65085ebb 100644
+--- a/extensions/memory-core/src/tools.ts
++++ b/extensions/memory-core/src/tools.ts
+@@ -315,7 +315,7 @@ export function createMemorySearchTool(options: MemoryToolOptions) {
+         const toolStartedAt = Date.now();
+         const searchesMemory = requestedCorpus !== "wiki";
+         const searchesWiki = requestedCorpus === "wiki" || requestedCorpus === "all";
+-        const memoryManagerPurpose = options.oneShotCliRun ? "cli" : undefined;
++        const memoryManagerPurpose = options.oneShotCliRun ? "cli" : "search";
+         const memoryManagersToClose = new Set<ActiveMemoryManagerContext["manager"]>();
+         let cleanupStarted = false;
+         const trackMemoryManager = (context: MemoryManagerContext): MemoryManagerContext => {
+diff --git a/src/gateway/server-methods/memory-search.test.ts b/src/gateway/server-methods/memory-search.test.ts
+index bc99a733a1..b740e7eafa 100644
+--- a/src/gateway/server-methods/memory-search.test.ts
++++ b/src/gateway/server-methods/memory-search.test.ts
+@@ -113,7 +113,7 @@ describe("memory.search gateway method", () => {
+       maxResults: expected,
+       minScore: 0.42,
+     });
+-    expect(manager.close).toHaveBeenCalledOnce();
++    expect(manager.close).not.toHaveBeenCalled();
+   });
+ 
+   it("rejects an unknown agentId without acquiring a manager", async () => {
+@@ -221,7 +221,7 @@ describe("memory.search gateway method", () => {
+     expect(getActiveMemorySearchManagerCore).toHaveBeenCalledWith({
+       cfg,
+       agentId: configured,
+-      purpose: "cli",
++      purpose: "search",
+     });
+     expect(resolveDefaultAgentId).not.toHaveBeenCalled();
+     expect(respond).toHaveBeenCalledWith(
+diff --git a/src/gateway/server-methods/memory-search.ts b/src/gateway/server-methods/memory-search.ts
+index b4c6215499..50823e73e0 100644
+--- a/src/gateway/server-methods/memory-search.ts
++++ b/src/gateway/server-methods/memory-search.ts
+@@ -125,12 +125,12 @@ export const memorySearchHandlers: GatewayRequestHandlers = {
+     }
+     let acquired: Awaited<ReturnType<typeof getActiveMemorySearchManagerCore>>;
+     try {
+-      // Use the transient CLI lifecycle so request cleanup cannot close a shared manager.
+-      // manager.search owns the same lazy/on-search sync behavior as the existing CLI path.
++      // Pure Gateway searches share one read-only manager per agent/config identity.
++      // Writer/sync managers retain their independent schema and integrity lifecycle.
+       acquired = await getActiveMemorySearchManagerCore({
+         cfg,
+         agentId,
+-        purpose: "cli",
++        purpose: "search",
+       });
+     } catch (error) {
+       respond(
+@@ -170,8 +170,6 @@ export const memorySearchHandlers: GatewayRequestHandlers = {
+         undefined,
+         errorShape(ErrorCodes.UNAVAILABLE, `memory search failed: ${formatErrorMessage(error)}`),
+       );
+-    } finally {
+-      await manager.close?.().catch(() => {});
+     }
+   },
+ };
+diff --git a/src/plugin-sdk/sqlite-runtime.ts b/src/plugin-sdk/sqlite-runtime.ts
+index 6b897c54c9..a204dfbe4e 100644
+--- a/src/plugin-sdk/sqlite-runtime.ts
++++ b/src/plugin-sdk/sqlite-runtime.ts
+@@ -5,6 +5,11 @@ export {
+   openOpenClawAgentDatabase,
+   resolveOpenClawAgentSqlitePath,
+ } from "../state/openclaw-agent-db.js";
++export {
++  assertCanonicalAgentPersistenceVersion,
++  assertOpenClawAgentCurrentRuntimeSchema,
++  assertSupportedAgentSchemaVersion,
++} from "../state/openclaw-agent-db-schema-helpers.js";
+ export { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
+ export { ensureOpenClawAgentStandingIntentsSchema } from "../state/openclaw-agent-standing-intents-schema.js";
+ export {
+diff --git a/src/plugins/memory-runtime.ts b/src/plugins/memory-runtime.ts
+index 625a4ee1c0..fe463f8b90 100644
+--- a/src/plugins/memory-runtime.ts
++++ b/src/plugins/memory-runtime.ts
+@@ -174,7 +174,7 @@ function ensureMemoryRuntime(params?: {
+ export async function getActiveMemorySearchManagerCore(params: {
+   cfg: OpenClawConfig;
+   agentId: string;
+-  purpose?: "default" | "status" | "cli";
++  purpose?: "default" | "status" | "cli" | "search";
+   inspectSources?: boolean;
+ }) {
+   const owner = ensureMemoryRuntime(params);
+diff --git a/src/plugins/registry-contribution-types.ts b/src/plugins/registry-contribution-types.ts
+index ba8242819f..59d371207f 100644
+--- a/src/plugins/registry-contribution-types.ts
++++ b/src/plugins/registry-contribution-types.ts
+@@ -224,14 +224,14 @@ export type MemoryPluginRuntime = {
+   getMemorySearchManager(params: {
+     cfg: OpenClawConfig;
+     agentId: string;
+-    purpose?: "default" | "status" | "cli";
++    purpose?: "default" | "status" | "cli" | "search";
+     /** Request a read-only source freshness scan; runtimes may ignore unsupported diagnostics. */
+     inspectSources?: boolean;
+   }): Promise<{
+     manager: RegisteredMemorySearchManager | null;
+     debug?: {
+       backend?: "builtin";
+-      purpose?: "default" | "status" | "cli";
++      purpose?: "default" | "status" | "cli" | "search";
+       managerMs?: number;
+     };
+     error?: string;
+-- 
+2.53.0
+

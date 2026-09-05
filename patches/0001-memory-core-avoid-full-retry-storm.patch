@@ -1,0 +1,286 @@
+From 3c91576a144029261435354efa42c4fd73566342 Mon Sep 17 00:00:00 2001
+From: Saladin Yao <saladin.yao@gmail.com>
+Date: Tue, 1 Sep 2026 13:48:10 +0800
+Subject: [PATCH] fix(memory-core): avoid full retry storm on revision race
+
+---
+ .../memory-core/src/memory/manager-db.ts      |  18 ++-
+ .../src/memory/manager-sync-ops.ts            |  59 +++++++-
+ .../memory/manager.reindex-recovery.test.ts   | 126 ++++++++++++++++++
+ 3 files changed, 198 insertions(+), 5 deletions(-)
+
+diff --git a/extensions/memory-core/src/memory/manager-db.ts b/extensions/memory-core/src/memory/manager-db.ts
+index 60bed2f6d7..fa95f32790 100644
+--- a/extensions/memory-core/src/memory/manager-db.ts
++++ b/extensions/memory-core/src/memory/manager-db.ts
+@@ -32,6 +32,19 @@ const MEMORY_REINDEX_UUID_PATTERN =
+   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+ const MEMORY_REINDEX_ORPHAN_MIN_AGE_MS = 24 * 60 * 60_000;
+ 
++export class MemoryIndexRevisionConflictError extends Error {
++  constructor(
++    readonly expectedRevision: number,
++    readonly liveRevision: number,
++  ) {
++    super(
++      `Memory index changed while full reindex was building ` +
++        `(expected revision ${expectedRevision}, found ${liveRevision}); retry the full reindex.`,
++    );
++    this.name = "MemoryIndexRevisionConflictError";
++  }
++}
++
+ function resolveMemoryReindexBaseName(
+   databaseBaseName: string,
+   entryName: string,
+@@ -168,10 +181,7 @@ export async function publishMemoryDatabaseTables(params: {
+     runSqliteImmediateTransactionSync(params.targetDb, () => {
+       const liveRevision = readMemoryDatabaseRevision(params.targetDb);
+       if (liveRevision !== params.expectedRevision) {
+-        throw new Error(
+-          `Memory index changed while full reindex was building ` +
+-            `(expected revision ${params.expectedRevision}, found ${liveRevision}); retry the full reindex.`,
+-        );
++        throw new MemoryIndexRevisionConflictError(params.expectedRevision, liveRevision);
+       }
+       const publishesPathFts = tableExists(
+         params.targetDb,
+diff --git a/extensions/memory-core/src/memory/manager-sync-ops.ts b/extensions/memory-core/src/memory/manager-sync-ops.ts
+index 5f6a4f07df..3f8403c42e 100644
+--- a/extensions/memory-core/src/memory/manager-sync-ops.ts
++++ b/extensions/memory-core/src/memory/manager-sync-ops.ts
+@@ -23,6 +23,7 @@ import { MemoryIndexDatabase } from "./manager-database-context.js";
+ import {
+   cleanupAgedMemoryReindexTempFiles,
+   closeMemoryDatabase,
++  MemoryIndexRevisionConflictError,
+   openMemoryDatabaseAtPath,
+   publishMemoryDatabaseTables,
+   readMemoryDatabaseRevision,
+@@ -154,6 +155,40 @@ export abstract class MemoryManagerSyncOps extends MemoryManagerSourceSyncOps {
+     );
+   }
+ 
++  private hasValidPublishedIndexIdentity(): boolean {
++    const syncProvider = this.syncProviderGeneration
++      ? this.syncProviderGeneration.provider
++      : this.provider;
++    const syncProviderKey = this.syncProviderGeneration
++      ? this.syncProviderGeneration.providerKey
++      : this.providerKey;
++    const syncProviderIdentities =
++      this.syncProviderGeneration?.identities ?? this.resolveProviderIndexIdentities();
++    return (
++      resolveMemoryIndexIdentityState({
++        meta: this.readMeta(),
++        provider: syncProvider ? { id: syncProvider.id, model: syncProvider.model } : null,
++        providerKey: syncProviderKey ?? undefined,
++        providerAliases: syncProviderIdentities.slice(1),
++        configuredSources: resolveConfiguredSourcesForMeta(this.sources),
++        configuredScopeHash: resolveConfiguredScopeHash({
++          workspaceDir: this.workspaceDir,
++          extraPaths: this.settings.extraPaths,
++          multimodal: {
++            enabled: this.settings.multimodal.enabled,
++            modalities: this.settings.multimodal.modalities,
++            maxFileBytes: this.settings.multimodal.maxFileBytes,
++          },
++        }),
++        chunkTokens: this.settings.chunking.tokens,
++        chunkOverlap: this.settings.chunking.overlap,
++        vectorReady: syncProvider ? this.vector.available === true : false,
++        hasIndexedChunks: this.hasIndexedChunks(),
++        ftsTokenizer: this.settings.store.fts.tokenizer,
++      }).status === "valid"
++    );
++  }
++
+   protected async runSync(params?: MemorySyncParams) {
+     try {
+       await this.runSyncPass(params);
+@@ -262,8 +297,11 @@ export abstract class MemoryManagerSyncOps extends MemoryManagerSourceSyncOps {
+       meta !== null && meta.chunkingVersion !== MEMORY_CHUNKING_VERSION && !hasTargetArchiveFiles;
+     const canRunRetryFullReindex =
+       indexIdentity.status !== "missing" || needsInitialIndex || canRebuildMissingIdentity;
++    // Search maintenance uses force to scan every source in a transient manager;
++    // it must not turn an otherwise valid published index into a full rebuild.
++    const forceFullReindex = params?.force && params.reason !== "search" && !hasTargetArchiveFiles;
+     const needsFullReindex =
+-      (params?.force && !hasTargetArchiveFiles) ||
++      forceFullReindex ||
+       needsInitialIndex ||
+       needsMissingIdentityReindex ||
+       needsExplicitIdentityReindex ||
+@@ -653,6 +691,25 @@ export abstract class MemoryManagerSyncOps extends MemoryManagerSourceSyncOps {
+         } catch {}
+       }
+       this.restoreReindexRetryState(originalRetryState);
++      if (
++        err instanceof MemoryIndexRevisionConflictError &&
++        this.hasValidPublishedIndexIdentity()
++      ) {
++        // A concurrent incremental sync won the publication race, so the live
++        // index is still valid and already newer than the discarded shadow.
++        // Retry only ordinary reconciliation; promoting this conflict to a
++        // full-reindex retry makes every later search rebuild the whole corpus.
++        this.memoryFullRetryDirty = false;
++        this.sessionsFullRetryDirty = false;
++        if (shouldRetryMemoryOnFailure) {
++          this.dirty = true;
++        }
++        if (shouldRetrySessionsOnFailure) {
++          this.sessionsDirty = true;
++          this.sessionsReconcileDirty = true;
++        }
++        throw err;
++      }
+       this.markFailedFullReindexRetry({
+         memory: shouldRetryMemoryOnFailure,
+         sessions: shouldRetrySessionsOnFailure,
+diff --git a/extensions/memory-core/src/memory/manager.reindex-recovery.test.ts b/extensions/memory-core/src/memory/manager.reindex-recovery.test.ts
+index ce59bfb6ee..8646d6cb5e 100644
+--- a/extensions/memory-core/src/memory/manager.reindex-recovery.test.ts
++++ b/extensions/memory-core/src/memory/manager.reindex-recovery.test.ts
+@@ -27,6 +27,7 @@ type ReindexHarness = {
+   memoryFullRetryDirty: boolean;
+   sessionsDirty: boolean;
+   sessionsFullRetryDirty: boolean;
++  sessionsReconcileDirty: boolean;
+   sessionsDirtyFiles: Set<string>;
+ };
+ 
+@@ -162,6 +163,131 @@ describe("memory manager reindex recovery", () => {
+     expect(harness.sessionsDirtyFiles.size).toBe(0);
+   });
+ 
++  it("downgrades a publication revision conflict to incremental reconciliation", async () => {
++    await fs.writeFile(path.join(memoryDir, "alpha.md"), "published alpha", "utf8");
++    const memoryManager = await openManager(
++      createCfg({
++        provider: "none",
++        sources: ["memory", "sessions"],
++      }),
++    );
++    await memoryManager.sync({ reason: "test", force: true });
++
++    const harness = memoryManager as unknown as ReindexHarness;
++    const publishedDb = harness.db;
++    const emptySyncPlan = { indexItems: [], finalize: () => undefined };
++    harness.syncMemoryFiles = async () => {
++      publishedDb
++        .prepare("UPDATE memory_index_state SET revision = revision + 1 WHERE id = 1")
++        .run();
++      return emptySyncPlan;
++    };
++    harness.syncArchiveFiles = async () => emptySyncPlan;
++
++    await expect(harness.runInPlaceReindex({ reason: "test", force: true })).rejects.toThrow(
++      "Memory index changed while full reindex was building",
++    );
++
++    expect(harness.dirty).toBe(true);
++    expect(harness.memoryFullRetryDirty).toBe(false);
++    expect(harness.sessionsDirty).toBe(true);
++    expect(harness.sessionsFullRetryDirty).toBe(false);
++    expect(harness.sessionsReconcileDirty).toBe(true);
++
++    const memorySyncCalls: Array<{ needsFullReindex: boolean }> = [];
++    const sessionSyncCalls: SyncArchiveParams[] = [];
++    harness.syncMemoryFiles = async (params) => {
++      memorySyncCalls.push(params);
++      return emptySyncPlan;
++    };
++    harness.syncArchiveFiles = async (params) => {
++      sessionSyncCalls.push(params);
++      return emptySyncPlan;
++    };
++
++    await harness.sync({ reason: "test" });
++
++    expect(memorySyncCalls).toEqual([expect.objectContaining({ needsFullReindex: false })]);
++    expect(sessionSyncCalls).toEqual([expect.objectContaining({ needsFullReindex: false })]);
++    expect(harness.memoryFullRetryDirty).toBe(false);
++    expect(harness.sessionsFullRetryDirty).toBe(false);
++  });
++
++  it("treats search force as source-wide incremental maintenance", async () => {
++    await fs.writeFile(path.join(memoryDir, "alpha.md"), "published alpha", "utf8");
++    const memoryManager = await openManager(
++      createCfg({
++        provider: "none",
++        sources: ["memory", "sessions"],
++      }),
++    );
++    await memoryManager.sync({ reason: "test", force: true });
++
++    const harness = memoryManager as unknown as ReindexHarness;
++    const emptySyncPlan = { indexItems: [], finalize: () => undefined };
++    const reindexCalls: Array<{ reason?: string; force?: boolean }> = [];
++    const memorySyncCalls: Array<{ needsFullReindex: boolean }> = [];
++    const sessionSyncCalls: SyncArchiveParams[] = [];
++    harness.dirty = true;
++    harness.sessionsDirty = true;
++    harness.runInPlaceReindex = async (params) => {
++      reindexCalls.push(params);
++    };
++    harness.syncMemoryFiles = async (params) => {
++      memorySyncCalls.push(params);
++      return emptySyncPlan;
++    };
++    harness.syncArchiveFiles = async (params) => {
++      sessionSyncCalls.push(params);
++      return emptySyncPlan;
++    };
++
++    await harness.sync({ reason: "search", force: true });
++
++    expect(reindexCalls).toHaveLength(0);
++    expect(memorySyncCalls).toEqual([expect.objectContaining({ needsFullReindex: false })]);
++    expect(sessionSyncCalls).toEqual([expect.objectContaining({ needsFullReindex: false })]);
++  });
++
++  it("keeps full retry state for a revision conflict when the published identity is invalid", async () => {
++    await fs.writeFile(path.join(memoryDir, "alpha.md"), "published alpha", "utf8");
++    const memoryManager = await openManager(
++      createCfg({
++        provider: "none",
++        sources: ["memory", "sessions"],
++      }),
++    );
++    await memoryManager.sync({ reason: "test", force: true });
++
++    const harness = memoryManager as unknown as ReindexHarness;
++    const publishedDb = harness.db;
++    const emptySyncPlan = { indexItems: [], finalize: () => undefined };
++    harness.writeMeta({
++      model: "fts-only",
++      provider: "none",
++      providerKey: harness.providerKey ?? undefined,
++      sources: ["memory"],
++      chunkTokens: 4000,
++      chunkOverlap: 0,
++    });
++    harness.syncMemoryFiles = async () => {
++      publishedDb
++        .prepare("UPDATE memory_index_state SET revision = revision + 1 WHERE id = 1")
++        .run();
++      return emptySyncPlan;
++    };
++    harness.syncArchiveFiles = async () => emptySyncPlan;
++
++    await expect(harness.runInPlaceReindex({ reason: "test", force: true })).rejects.toThrow(
++      "Memory index changed while full reindex was building",
++    );
++
++    expect(harness.dirty).toBe(true);
++    expect(harness.memoryFullRetryDirty).toBe(true);
++    expect(harness.sessionsDirty).toBe(true);
++    expect(harness.sessionsFullRetryDirty).toBe(true);
++  });
++
+   it("keeps the published memory index when a shadow full reindex fails late", async () => {
+     await fs.writeFile(path.join(memoryDir, "alpha.md"), "published alpha", "utf8");
+     const memoryManager = await openManager(
+-- 
+2.53.0
+

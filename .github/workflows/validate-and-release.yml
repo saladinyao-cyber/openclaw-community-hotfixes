@@ -1,0 +1,47 @@
+name: Validate and release
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Validate fail-closed repository policy
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 scripts/validate.py
+      - name: Run validator negative tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests -v
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build deterministic release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          archive="openclaw-community-hotfixes-${GITHUB_REF_NAME}.tar.gz"
+          git archive --format=tar.gz --prefix="openclaw-community-hotfixes-${GITHUB_REF_NAME}/" -o "dist/${archive}" HEAD
+          (cd dist && sha256sum "${archive}" > SHA256SUMS)
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
